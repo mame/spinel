@@ -688,6 +688,22 @@ static void sp_Proc_scan(void *p) { sp_Proc *pr = (sp_Proc *)p; if (pr->cap && p
 static sp_Proc *sp_proc_new(sp_proc_fn_t fn, void *cap, void (*cap_scan)(void *)) { sp_Proc *p = (sp_Proc *)sp_gc_alloc(sizeof(sp_Proc), NULL, sp_Proc_scan); p->fn = fn; p->cap = cap; p->cap_scan = cap_scan; return p; }
 static mrb_int sp_proc_call(sp_Proc *p, mrb_int arg) { return (p && p->fn) ? p->fn(p->cap, arg) : 0; }
 
+/* ---- BoundMethod ----
+ * Heap-allocated `(self, fn)` pair so a `method(:foo)` value can survive
+ * being stored in an ivar / passed across call boundaries. Spinel
+ * registers `BoundMethod` as a synthetic built-in class (no struct
+ * emission, the runtime owns the layout) so the value flows through the
+ * regular obj path — `obj_BoundMethod` field types, `obj_BoundMethod_ptr_array`
+ * for arrays — instead of needing its own primitive-type tag.
+ */
+typedef struct sp_BoundMethod_s sp_BoundMethod;
+struct sp_BoundMethod_s { void *self_ptr; void *fn_ptr; };
+static sp_BoundMethod *sp_BoundMethod_new(void *self_ptr, void *fn_ptr) {
+  sp_BoundMethod *bm = (sp_BoundMethod *)sp_gc_alloc(sizeof(struct sp_BoundMethod_s), NULL, NULL);
+  bm->self_ptr = self_ptr; bm->fn_ptr = fn_ptr;
+  return bm;
+}
+
 /* ---- StringIO runtime ---- */
 typedef struct { char *buf; int64_t len; int64_t cap; int64_t pos; int64_t lineno; int closed; } sp_StringIO;
 static void sio_grow(sp_StringIO *sio, int64_t need) { int64_t req = sio->pos + need; if (req <= sio->cap) return; int64_t nc = sio->cap ? sio->cap : 64; while (nc < req) nc *= 2; sio->buf = (char *)realloc(sio->buf, nc + 1); sio->cap = nc; }

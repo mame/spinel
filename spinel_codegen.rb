@@ -133,6 +133,11 @@ class Compiler
     # with individual scalar locals. Distinct from value_type: SRA allows
     # attr_writer (mutation is rewritten to per-field assignment).
     @cls_is_sra = []
+    # Synthetic built-in class flag. A built-in class lives in @cls_names
+    # so it flows through the regular obj path (`obj_<Name>` field types,
+    # `obj_<Name>_ptr_array`, etc.), but the runtime owns its struct
+    # layout — `emit_class_structs` skips both the typedef and the body.
+    @cls_is_builtin = []
 
     # ---- Constants (parallel arrays) ----
     @const_names = "".split(",")
@@ -1518,7 +1523,18 @@ class Compiler
           end
           return "int"
         end
+        # `bm.call(args)` / `bm[args]` on a BoundMethod returns mrb_int —
+        # the calling convention is `(self, mrb_int...)` -> `mrb_int`.
+        if rt == "obj_BoundMethod"
+          return "int"
+        end
       end
+    end
+
+    # `method(:foo)` inside a class body produces a heap-allocated
+    # BoundMethod (synthetic builtin class — see register_builtin_classes).
+    if mname == "method" && recv < 0 && @current_class_idx >= 0
+      return "obj_BoundMethod"
     end
 
     # Method name-based type inference
@@ -3577,7 +3593,41 @@ class Compiler
   end
 
   # ---- Collection pass ----
+  # Pre-register synthetic built-in classes that the runtime owns
+  # (struct layout + helpers in sp_runtime.h). They live in `@cls_names`
+  # so the regular `obj_<Name>` machinery (field types, ptr_array,
+  # cls_id-based dispatch, …) handles them without extra special cases.
+  def register_builtin_classes
+    register_builtin_class("BoundMethod")
+  end
+
+  def register_builtin_class(cname)
+    @cls_names.push(cname)
+    @cls_parents.push("")
+    @cls_ivar_names.push("")
+    @cls_ivar_types.push("")
+    @cls_meth_names.push("")
+    @cls_meth_params.push("")
+    @cls_meth_ptypes.push("")
+    @cls_meth_returns.push("")
+    @cls_meth_bodies.push("")
+    @cls_meth_defaults.push("")
+    @cls_meth_ptypes_empty.push("")
+    @cls_meth_has_yield.push("")
+    @cls_attr_readers.push("")
+    @cls_attr_writers.push("")
+    @cls_cmeth_names.push("")
+    @cls_cmeth_params.push("")
+    @cls_cmeth_ptypes.push("")
+    @cls_cmeth_returns.push("")
+    @cls_cmeth_bodies.push("")
+    @cls_is_value_type.push(0)
+    @cls_is_sra.push(0)
+    @cls_is_builtin.push(1)
+  end
+
   def collect_all
+    register_builtin_classes
     root = @root_id
     if @nd_type[root] != "ProgramNode"
       return
@@ -3810,6 +3860,7 @@ class Compiler
     @cls_names.push(cname)
     @cls_is_value_type.push(0)
     @cls_is_sra.push(0)
+    @cls_is_builtin.push(0)
     @cls_parents.push(parent)
     # Initialize struct fields as ivars
     ivar_names = ""
@@ -4740,6 +4791,7 @@ class Compiler
     @cls_names.push(cname)
     @cls_is_value_type.push(0)
     @cls_is_sra.push(0)
+    @cls_is_builtin.push(0)
     @cls_parents.push("")
     @cls_ivar_names.push("")
     @cls_ivar_types.push("")
@@ -9748,10 +9800,14 @@ class Compiler
   end
 
   def emit_class_structs
-    # Forward declare typedefs
+    # Forward declare typedefs. Built-in classes (e.g. BoundMethod) own
+    # their typedef + struct in sp_runtime.h; skip both to avoid a
+    # duplicate definition.
     i = 0
     while i < @cls_names.length
-      emit_raw("typedef struct sp_" + @cls_names[i] + "_s sp_" + @cls_names[i] + ";")
+      if @cls_is_builtin[i] == 0
+        emit_raw("typedef struct sp_" + @cls_names[i] + "_s sp_" + @cls_names[i] + ";")
+      end
       i = i + 1
     end
     if @cls_names.length > 0
@@ -9779,6 +9835,9 @@ class Compiler
       return
     end
     @struct_emitted[ci] = 1
+    if @cls_is_builtin[ci] == 1
+      return
+    end
     # Walk this class and all its ancestors (whose ivars are flattened
     # into this struct by emit_parent_fields) and emit any value-type
     # field's class struct first.
@@ -9995,6 +10054,13 @@ class Compiler
     i = 0
     while i < @cls_names.length
       cname = @cls_names[i]
+      # Built-in classes own their constructor in sp_runtime.h; skip the
+      # declarations Spinel would otherwise emit (they'd conflict with
+      # the runtime signature).
+      if @cls_is_builtin[i] == 1
+        i = i + 1
+        next
+      end
       # Constructor
       init_idx = cls_find_method_direct(i, "initialize")
       if @cls_is_value_type[i] == 1
@@ -10279,6 +10345,12 @@ class Compiler
   def emit_class_methods
     i = 0
     while i < @cls_names.length
+      # Built-in classes (e.g. BoundMethod) own their constructor / methods
+      # in sp_runtime.h; skip the bodies Spinel would otherwise emit.
+      if @cls_is_builtin[i] == 1
+        i = i + 1
+        next
+      end
       emit_constructor(i)
       mnames = @cls_meth_names[i].split(";")
       returns = @cls_meth_returns[i].split(";")
@@ -13010,6 +13082,33 @@ class Compiler
     mname = @nd_name[nid]
     recv = @nd_receiver[nid]
 
+    # bm.call(args) / bm[args] on a BoundMethod — the value is a heap-
+    # allocated `(self, fn)` pair. Lower to a function-pointer cast and
+    # an indirect call passing `bm->self_ptr` as the first argument.
+    # The fn signature is `(void *, mrb_int...) -> mrb_int`.
+    if (mname == "call" || mname == "[]") && recv >= 0
+      if base_type(infer_type(recv)) == "obj_BoundMethod"
+        rc = compile_expr(recv)
+        args_id = @nd_arguments[nid]
+        arg_strs = "".split(",")
+        sig_args = "void *"
+        if args_id >= 0
+          aargs = get_args(args_id)
+          k = 0
+          while k < aargs.length
+            arg_strs.push(compile_expr(aargs[k]))
+            sig_args = sig_args + ", mrb_int"
+            k = k + 1
+          end
+        end
+        joined = arg_strs.join(", ")
+        if joined != ""
+          joined = ", " + joined
+        end
+        return "((mrb_int (*)(" + sig_args + "))(" + rc + ")->fn_ptr)((" + rc + ")->self_ptr" + joined + ")"
+      end
+    end
+
     # Fiber.new { block }
     if mname == "new" && recv >= 0
       if constructor_class_name(recv) == "Fiber"
@@ -13413,7 +13512,7 @@ class Compiler
       end
     end
     if mname == "method"
-      # method(:name) - record the method reference
+      # method(:name) — two paths.
       args_id = @nd_arguments[nid]
       if args_id >= 0
         arg_ids = get_args(args_id)
@@ -13422,8 +13521,22 @@ class Compiler
           if mref == ""
             mref = @nd_name[arg_ids[0]]
           end
-          # Return a placeholder - the actual dispatch happens in .call
-          # We store this in the parent LocalVariableWriteNode handler
+          # Inside a class body, return a heap-allocated BoundMethod
+          # carrying (self, &sp_<Class>_<name>). The value is typed
+          # `obj_BoundMethod` (synthetic builtin class) so it flows
+          # through the regular obj path: storable in ivars / arrays
+          # / poly slots without bespoke per-type plumbing.
+          if @current_class_idx >= 0
+            cls_for_bm = @cls_names[@current_class_idx]
+            self_arrow_for_bm = "self"
+            if @cls_is_value_type[@current_class_idx] == 1
+              self_arrow_for_bm = "&self"
+            end
+            return "sp_BoundMethod_new((void *)" + self_arrow_for_bm + ", (void *)&sp_" + cls_for_bm + "_" + mref + ")"
+          end
+          # Top-level path: keep the static-alias placeholder. Calls
+          # like `m = method(:foo); m.call(x)` are rewritten in the
+          # LocalVariableRead handler to a direct sp_<foo>(x) call.
           @pending_method_ref = mref
           return "0 /* method:" + mref + " */"
         end
