@@ -9100,6 +9100,26 @@ class Compiler
             end
           end
         end
+        # `@arr[i] = v` against an ivar already promoted to a typed
+        # `<obj>_ptr_array` and now seeing a mismatched value (poly,
+        # different obj, or a built-in array) — widen to poly_array.
+        # Optcarrot's `add_mappings(.., @ram, ..)` and `method(:foo)`
+        # heterogeneous call sites land here.
+        if is_ptr_array_type(cur_t) == 1
+          args_id = @nd_arguments[nid]
+          if args_id >= 0
+            ai = get_args(args_id)
+            if ai.length >= 2
+              vt = infer_type(ai[ai.length - 1])
+              elem_t = ptr_array_elem_type(cur_t)
+              if vt != "" && vt != "int" && vt != "nil" && vt != elem_t
+                replace_ivar_type(@current_class_idx, iname, "poly_array")
+                @needs_rb_value = 1
+                @needs_gc = 1
+              end
+            end
+          end
+        end
       end
     end
     # Recurse via the centralized child walker (push_child_ids covers
@@ -27299,6 +27319,17 @@ class Compiler
     end
     if is_ptr_array_type(rt) == 1
       emit("  sp_PtrArray_set(" + rc + ", " + idx + ", (void *)" + val + ");")
+      return
+    end
+    if rt == "poly_array"
+      vbox = val
+      if arg_ids.length >= 2
+        vt = infer_type(arg_ids[1])
+        if vt != "poly"
+          vbox = box_value_to_poly(vt, val)
+        end
+      end
+      emit("  sp_PolyArray_set(" + rc + ", " + idx + ", " + vbox + ");")
       return
     end
     if rt == "str_int_hash"
