@@ -3020,6 +3020,17 @@ class Compiler
     if mname == "to_f"
       return "float"
     end
+    # `<int>.step(end, step)` (no block, used as int_array — passed to
+    # `.each`, stored, etc.). Spinel had a step-with-block iteration
+    # path but no value form, so call sites without a block fell
+    # through to the unresolved-method warning and emitted `0`.
+    # Returning `int_array` here lets callers treat the result as a
+    # built-in array via the runtime sp_IntArray_from_step helper.
+    if mname == "step" && recv >= 0 && infer_type(recv) == "int"
+      if @nd_block[nid] < 0
+        return "int_array"
+      end
+    end
     # Kernel coercion methods: Integer(x) / Float(x) return their class.
     # Only treat as a Kernel call when there's no explicit receiver — with
     # a receiver, "Integer" / "Float" would be ConstantReadNode lookups,
@@ -21289,6 +21300,25 @@ class Compiler
       r = compile_to_a_range_expr(nid, recv)
       if r != ""
         return r
+      end
+    end
+
+    # `<int>.step(end, step)` without a block — return a fresh
+    # int_array. Pairs with the type-inference branch in
+    # infer_method_name_type. The runtime helper handles both
+    # ascending and descending steps; an empty array results when
+    # st == 0 or s/e are inverted relative to st's sign.
+    if mname == "step" && recv >= 0 && infer_type(recv) == "int" && @nd_block[nid] < 0
+      args_id_step = @nd_arguments[nid]
+      if args_id_step >= 0
+        a_step = get_args(args_id_step)
+        if a_step.length >= 2
+          @needs_int_array = 1
+          @needs_gc = 1
+          end_e = compile_expr(a_step[0])
+          step_e = compile_expr(a_step[1])
+          return "sp_IntArray_from_step(" + rc + ", " + end_e + ", " + step_e + ")"
+        end
       end
     end
 
